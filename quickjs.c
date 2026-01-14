@@ -6684,10 +6684,35 @@ JSValue JS_GetGlobalObject(JSContext *ctx)
     return js_dup(ctx->global_obj);
 }
 
+/* === Error callback for external handling (e.g., arc-shooter) === */
+static void (*g_qjs_error_callback)(const char *msg, const char *stack) = NULL;
+
+void JS_SetErrorCallback(void (*callback)(const char *msg, const char *stack))
+{
+    g_qjs_error_callback = callback;
+}
+
 /* WARNING: obj is freed */
 JSValue JS_Throw(JSContext *ctx, JSValue obj)
 {
     JSRuntime *rt = ctx->rt;
+
+    // 如果注册了错误回调，通知外部
+    if (g_qjs_error_callback) {
+        const char *msg = JS_ToCString(ctx, obj);
+        const char *stack_str = NULL;
+        if (JS_IsError(obj)) {
+            JSValue stack = JS_GetPropertyStr(ctx, obj, "stack");
+            if (!JS_IsUndefined(stack)) {
+                stack_str = JS_ToCString(ctx, stack);
+            }
+            JS_FreeValue(ctx, stack);
+        }
+        g_qjs_error_callback(msg ? msg : "[unknown error]", stack_str);
+        if (msg) JS_FreeCString(ctx, msg);
+        if (stack_str) JS_FreeCString(ctx, stack_str);
+    }
+
     JS_FreeValue(ctx, rt->current_exception);
     rt->current_exception = obj;
     return JS_EXCEPTION;
