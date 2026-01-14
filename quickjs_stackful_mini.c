@@ -385,7 +385,7 @@ void* stackful_resume_with_value(stackful_schedule *S, int id, void *value) {
     DEBUG_LOG("[stackful_resume_with_value] <<< RETURNED from tina_resume, result=%p\n", result);
     DEBUG_LOG("[stackful_resume_with_value] tl_current_coro=%p (should still be target)\n",
               (void*)tl_current_coro);
-    
+
     /* CRITICAL FIX: Update QuickJS stack top after switching to coroutine's C stack
      * QuickJS detects stack overflow by checking C stack pointer against stack_limit,
      * but stackful coroutine uses a different C stack. Must update stack_top/stack_limit
