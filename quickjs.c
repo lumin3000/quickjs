@@ -6696,23 +6696,8 @@ void JS_SetErrorCallback(void (*callback)(const char *msg, const char *stack))
 JSValue JS_Throw(JSContext *ctx, JSValue obj)
 {
     JSRuntime *rt = ctx->rt;
-
-    // 如果注册了错误回调，通知外部
-    if (g_qjs_error_callback) {
-        const char *msg = JS_ToCString(ctx, obj);
-        const char *stack_str = NULL;
-        if (JS_IsError(obj)) {
-            JSValue stack = JS_GetPropertyStr(ctx, obj, "stack");
-            if (!JS_IsUndefined(stack)) {
-                stack_str = JS_ToCString(ctx, stack);
-            }
-            JS_FreeValue(ctx, stack);
-        }
-        g_qjs_error_callback(msg ? msg : "[unknown error]", stack_str);
-        if (msg) JS_FreeCString(ctx, msg);
-        if (stack_str) JS_FreeCString(ctx, stack_str);
-    }
-
+    // 注意: 错误回调现在在 build_backtrace 完成后触发,
+    // 那时堆栈信息已经完整
     JS_FreeValue(ctx, rt->current_exception);
     rt->current_exception = obj;
     return JS_EXCEPTION;
@@ -7075,6 +7060,26 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
                                JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     } else {
         JS_FreeValue(ctx, stack);
+    }
+
+    // 触发错误回调 - 此时堆栈信息已完整
+    if (g_qjs_error_callback && !JS_IsUndefined(error_val)) {
+        const char *msg = JS_ToCString(ctx, error_val);
+        const char *stack_str = NULL;
+        // 优先从 error_back_trace 获取堆栈 (适用于所有异常类型)
+        if (!JS_IsUndefined(ctx->error_back_trace)) {
+            stack_str = JS_ToCString(ctx, ctx->error_back_trace);
+        } else if (JS_IsError(error_val)) {
+            // 备选: 从 Error 对象的 stack 属性获取
+            JSValue stack_val = JS_GetPropertyStr(ctx, error_val, "stack");
+            if (!JS_IsUndefined(stack_val)) {
+                stack_str = JS_ToCString(ctx, stack_val);
+            }
+            JS_FreeValue(ctx, stack_val);
+        }
+        g_qjs_error_callback(msg ? msg : "[unknown error]", stack_str);
+        if (msg) JS_FreeCString(ctx, msg);
+        if (stack_str) JS_FreeCString(ctx, stack_str);
     }
 
     rt->in_build_stack_trace = false;
