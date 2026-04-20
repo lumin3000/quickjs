@@ -47,7 +47,7 @@ extern "C" {
 #include <malloc.h>
 #elif defined(__FreeBSD__)
 #include <malloc_np.h>
-#elif defined(_WIN32)
+#elif defined(_WIN32) && !defined(_MSC_VER)
 #include <windows.h>
 #endif
 #if !defined(_WIN32) && !defined(EMSCRIPTEN) && !defined(__wasi__)

@@ -43,6 +43,7 @@
 #include <dirent.h>
 #endif
 #if defined(_WIN32)
+#include <winsock2.h>
 #include <windows.h>
 #include <direct.h>
 #include <io.h>

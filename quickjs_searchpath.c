@@ -9,6 +9,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include <limits.h>
+#if defined(_WIN32) && !defined(PATH_MAX)
+#define PATH_MAX 260
+#endif
 #include "quickjs.h"
 
 /* Path configuration - identical to Lua */

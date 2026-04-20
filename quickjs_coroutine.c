@@ -6,7 +6,12 @@
 #include "quickjs_coroutine.h"
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <pthread.h>
+#endif
 
 /* ========== 内部数据结构 ========== */
 
@@ -22,12 +27,29 @@ struct JSCoroutineManager {
     JSCoroutineWaiter *waiters[MAX_SESSIONS];
 
     /* 线程安全 */
+#if defined(_WIN32)
+    CRITICAL_SECTION lock;
+#else
     pthread_mutex_t lock;
+#endif
 
     /* 统计 */
     int waiting_count;
     int total_resumed;
 };
+
+/* Portable mutex wrappers */
+#if defined(_WIN32)
+#define MUTEX_INIT(m)    InitializeCriticalSection(m)
+#define MUTEX_DESTROY(m) DeleteCriticalSection(m)
+#define MUTEX_LOCK(m)    EnterCriticalSection(m)
+#define MUTEX_UNLOCK(m)  LeaveCriticalSection(m)
+#else
+#define MUTEX_INIT(m)    pthread_mutex_init(m, NULL)
+#define MUTEX_DESTROY(m) pthread_mutex_destroy(m)
+#define MUTEX_LOCK(m)    pthread_mutex_lock(m)
+#define MUTEX_UNLOCK(m)  pthread_mutex_unlock(m)
+#endif
 
 /* ========== 辅助函数 ========== */
 
@@ -81,7 +103,7 @@ JSCoroutineManager* JS_NewCoroutineManager(JSRuntime *rt) {
 
     mgr->rt = rt;
     mgr->next_session = 1;
-    pthread_mutex_init(&mgr->lock, NULL);
+    MUTEX_INIT(&mgr->lock);
 
     return mgr;
 }
@@ -100,21 +122,21 @@ void JS_FreeCoroutineManager(JSCoroutineManager *mgr) {
         }
     }
 
-    pthread_mutex_destroy(&mgr->lock);
+    MUTEX_DESTROY(&mgr->lock);
     free(mgr);
 }
 
 /* ========== Session 管理 ========== */
 
 int JS_CoroutineGenerateSession(JSCoroutineManager *mgr) {
-    pthread_mutex_lock(&mgr->lock);
+    MUTEX_LOCK(&mgr->lock);
 
     int session = mgr->next_session++;
     if (mgr->next_session >= MAX_SESSIONS) {
         mgr->next_session = 1;
     }
 
-    pthread_mutex_unlock(&mgr->lock);
+    MUTEX_UNLOCK(&mgr->lock);
 
     return session;
 }
@@ -132,12 +154,12 @@ int JS_CoroutineWait(
         return -1;
     }
 
-    pthread_mutex_lock(&mgr->lock);
+    MUTEX_LOCK(&mgr->lock);
 
     /* 创建等待者 */
     JSCoroutineWaiter *waiter = malloc(sizeof(JSCoroutineWaiter));
     if (!waiter) {
-        pthread_mutex_unlock(&mgr->lock);
+        MUTEX_UNLOCK(&mgr->lock);
         return -1;
     }
 
@@ -153,7 +175,7 @@ int JS_CoroutineWait(
 
     mgr->waiting_count++;
 
-    pthread_mutex_unlock(&mgr->lock);
+    MUTEX_UNLOCK(&mgr->lock);
 
     return 0;
 }
@@ -163,7 +185,7 @@ int JS_CoroutineResume(
     int session_id,
     JSValue data
 ) {
-    pthread_mutex_lock(&mgr->lock);
+    MUTEX_LOCK(&mgr->lock);
 
     /* 查找等待者 */
     int slot = session_id % MAX_SESSIONS;
@@ -184,7 +206,7 @@ int JS_CoroutineResume(
         waiter = waiter->next;
     }
 
-    pthread_mutex_unlock(&mgr->lock);
+    MUTEX_UNLOCK(&mgr->lock);
 
     if (!waiter) {
         return -1;  /* 没找到 */
@@ -222,10 +244,10 @@ int JS_CoroutineResume(
     JS_FreeValue(ctx, generator);
     free(waiter);
 
-    pthread_mutex_lock(&mgr->lock);
+    MUTEX_LOCK(&mgr->lock);
     mgr->waiting_count--;
     mgr->total_resumed++;
-    pthread_mutex_unlock(&mgr->lock);
+    MUTEX_UNLOCK(&mgr->lock);
 
     return 0;
 }
