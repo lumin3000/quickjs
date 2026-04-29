@@ -299,6 +299,10 @@ int stackful_resume(stackful_schedule *S, int id) {
 
         target->status = STACKFUL_STATUS_DEAD;
 
+        /* Backend-specific cleanup before freeing buffer (e.g. wasm/JSPI
+         * mailbox map drop). No-op on native backends. */
+        tina_finalize(target->coro);
+
         /* Cleanup */
         if (target->coro->buffer) {
             free(target->coro->buffer);
@@ -402,6 +406,10 @@ void* stackful_resume_with_value(stackful_schedule *S, int id, void *value) {
 
         target->status = STACKFUL_STATUS_DEAD;
 
+        /* Backend-specific cleanup before freeing buffer (e.g. wasm/JSPI
+         * mailbox map drop). No-op on native backends. */
+        tina_finalize(target->coro);
+
         /* Cleanup */
         if (target->coro->buffer) {
             free(target->coro->buffer);
@@ -415,7 +423,7 @@ void* stackful_resume_with_value(stackful_schedule *S, int id, void *value) {
         tl_current_coro = NULL;
 
         DEBUG_LOG("[stackful_resume_with_value] Coroutine %d destroyed (count=%d)\n", id, S->count);
-        
+
         /* Return NULL for completed coroutine */
         result = NULL;
     } else {
