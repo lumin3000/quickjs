@@ -4,19 +4,7 @@
 
 ## 扩展列表
 
-### 1. quickjs_coroutine
-**功能**：为 QuickJS 提供协程支持
-- 类似 Lua 的 coroutine.yield/resume
-- 管理 generator 的 session 映射
-- 线程安全的协程恢复机制
-
-**文件**：
-- `quickjs_coroutine.c` - 实现
-- `quickjs_coroutine.h` - 接口
-
-**用途**：让 JavaScript generator 能像 Lua 协程一样工作
-
-### 2. quickjs_searchpath
+### 1. quickjs_searchpath
 **功能**：提供 Lua 风格的文件查找功能
 - 完全对齐 Lua 的 package.searchpath
 - 支持路径模板（`?` 占位符）
@@ -29,65 +17,28 @@
 
 **用途**：动态查找和加载模块文件
 
+### 2. quickjs_stackful_mini
+**功能**：基于 Tina 的 stackful 协程层
+- 类似 Lua 的 coroutine.yield/resume，但不需要业务代码写 generator
+- C 协程切栈通过 Tina 提供
+- 数据存储和调度器内置
+
+**文件**：
+- `quickjs_stackful_mini.c` - 实现
+- `quickjs_stackful_mini.h` - 接口
+- `tina.h` - Tina 协程库
+
+**用途**：jtask service 的协程切换
+
+## 历史
+
+之前还有一个 `quickjs_coroutine.c` 扩展（Generator-based 协程调度），
+在 2026-04-29 移除——它被注册但 0 处实际调用，由 `quickjs_stackful_mini`
+取代。
+
 ## 设计原则
 
-1. **通用性** - 不依赖特定项目，任何 QuickJS 项目都可使用
+1. **通用性** - 不依赖特定项目
 2. **对齐 Lua** - 行为和接口尽量与 Lua 保持一致
-3. **独立性** - 每个扩展独立，可单独使用
+3. **独立性** - 每个扩展独立
 4. **高性能** - C 实现，最小化开销
-
-## 使用方式
-
-### 编译时包含
-```makefile
-# 在你的项目中
-SOURCES += quickjs_generator/quickjs_coroutine.c
-SOURCES += quickjs_generator/quickjs_searchpath.c
-```
-
-### 初始化
-```c
-// 在 main.c 中
-#include "quickjs_generator/quickjs_coroutine.h"
-#include "quickjs_generator/quickjs_searchpath.h"
-
-int main() {
-    JSContext *ctx = JS_NewContext(rt);
-
-    // 初始化扩展
-    JS_InitCoroutine(ctx);      // 协程支持
-    js_init_searchpath(ctx);     // 文件查找
-
-    // ...
-}
-```
-
-### JavaScript 中使用
-```javascript
-// 使用 searchPath
-const path = searchPath("module.name", "src/?.js;lib/?.js");
-
-// 使用协程（通过 yield）
-function* myGenerator() {
-    const result = yield session_id;
-    // ...
-}
-```
-
-## 为什么放在这里？
-
-1. **不是 jtask 特有** - 这些是通用功能，不仅 jtask 可用
-2. **补充 QuickJS** - QuickJS 本身缺少这些功能
-3. **便于复用** - 其他项目也可以使用这些扩展
-4. **清晰的层次** - 语言扩展 vs 应用框架
-
-## 未来扩展
-
-可能添加的扩展：
-- `quickjs_debug.c` - 统一的调试接口
-- `quickjs_fs_extra.c` - 增强的文件系统操作
-- `quickjs_process.c` - 进程管理功能
-
----
-
-**核心理念**：把通用功能做成 QuickJS 扩展，而不是塞进应用代码里。
