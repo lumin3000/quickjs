@@ -28,7 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifndef _MSC_VER
+#if !defined(_MSC_VER) && !defined(__EMSCRIPTEN__)
 #include <execinfo.h>  // For backtrace
 #endif
 

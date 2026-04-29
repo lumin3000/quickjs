@@ -78,6 +78,15 @@ typedef sig_t sighandler_t;
 extern char **environ;
 #endif
 
+#if defined(__EMSCRIPTEN__)
+/* wasm:libc 缺 sighandler_t 别名 + environ 不在公共头里. 简单兜底:
+ * - sighandler_t 走 musl 的 __sighandler_t.
+ * - environ 在 wasm 上由 emscripten libc 提供,声明 extern 即可.
+ */
+typedef void (*sighandler_t)(int);
+extern char **environ;
+#endif
+
 #endif /* _WIN32 */
 
 #include "cutils.h"
