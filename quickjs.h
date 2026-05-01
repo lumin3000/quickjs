@@ -447,6 +447,13 @@ JS_EXTERN void JS_SetMaxStackSize(JSRuntime *rt, size_t stack_size);
 /* should be called when changing thread to update the stack top value
    used to check stack overflow. */
 JS_EXTERN void JS_UpdateStackTop(JSRuntime *rt);
+
+/* === Diagnostic only: dump current stack frame to stderr ===
+ * Read-only.label 用来区分 PRE / POST.tag 是 desired_arg_index.
+ *
+ * 🔍 WASM/JSPI 调查遗留(2026-04-30 封存).只读,不调用即等同于不存在.
+ * 详见 docs/handoff_jspi_integration_2026_04_30.md "2026-04-30 调查总结". */
+JS_EXTERN void JS_DiagDumpCurrentFrame(JSContext *ctx, const char *label);
 JS_EXTERN JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque);
 JS_EXTERN void JS_FreeRuntime(JSRuntime *rt);
 JS_EXTERN void *JS_GetRuntimeOpaque(JSRuntime *rt);

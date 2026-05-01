@@ -52,6 +52,9 @@ typedef struct {
     stackful_func user_func;     /* Original function */
     int yield_count;             /* Number of yields (for status tracking) */
     int self_id;                 /* This coroutine's ID (for asymmetric yield) */
+#ifdef __EMSCRIPTEN__
+    int launched;                /* wasm/JSPI: 0 until first tina_wasm_launch */
+#endif
 } tina_wrapper;
 
 /* ========== Scheduler structure ========== */

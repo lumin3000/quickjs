@@ -32,6 +32,10 @@
 #include <execinfo.h>  // For backtrace
 #endif
 
+#ifdef __EMSCRIPTEN__
+extern uintptr_t emscripten_stack_get_current(void);
+#endif
+
 #define DEFAULT_COROUTINE 16
 #define TINA_DEFAULT_STACK_SIZE (1024*1024)  /* 1MB, safe for modern systems */
 
@@ -51,7 +55,87 @@
     #define THREAD_LOCAL _Thread_local
 #endif
 
+/* native 后端:OS thread 内"当前 coro"用 thread-local 跟踪 (single-threaded
+ * fiber 语义).wasm/JSPI 后端不用这个 — 见下面的 active_stack. */
 static THREAD_LOCAL tina* tl_current_coro = NULL;
+
+/* ============================================================================
+ * WASM/JSPI 路径封存中（2026-04-30）
+ *
+ * 根因(已诊断,未解决):QuickJS JS_CallInternal interpreter 主循环的局部
+ * 变量副本(emcc 编译为 wasm shadow stack 槽 / wasm local)跨 V8 promising
+ * stack 切栈后值失效.详见 docs/handoff_jspi_integration_2026_04_30.md
+ * "2026-04-30 调查总结".
+ *
+ * 本段 wasm/JSPI 代码保留作为"已修对的基础设施 + 已验证无效的修法"双重
+ * 物证.下次重启 wasm 路径前先读 docs/plan_tina_wasm_contract.md §6 暂停
+ * 决定.
+ *
+ * 已走过的 4 条死路（按时间顺序）:
+ *   1. shadow stack 物理覆盖
+ *   2. QuickJS argv 零拷贝指向 caller frame
+ *   3. JSStackFrame 字段被踩
+ *   4. JS_CallInternal C 局部缓存(真根因,stackful_mini 层无法干预)
+ *
+ * 已验证状态分类:
+ *   ✅ sf_active_stack[] / sf_active_push/pop/top_ptr / wasm 分支的
+ *      stackful_resume[_with_value]/stackful_yield* 改写 — 解决 L3 嵌套
+ *      caller 链,与最终 hang 成因无关,wasm 路径必须的基础设施.
+ *   ✅ stackful_resume 入口 self-resume fail-fast abort — 下次重启 wasm
+ *      时 self-resume 立即 backtrace,有用,保留.
+ *   🔍 [sf PRE/POST] / [stackful_resume CALLER] / [yield_with_value PRE/POST]
+ *      等 fprintf 诊断 trace — 保留代码作为重启时直接打开的诊断点.
+ *
+ * 禁止:在不读 hand-off 调查总结的情况下尝试新一轮诊断或修复.
+ * ============================================================================ */
+
+#ifdef __EMSCRIPTEN__
+/* wasm/JSPI: per-worker-thread active coro stack.
+ *
+ * 设计:同一个 worker thread 内可能有多条挂起的 promising stack (dispatcher
+ * + 嵌套 child coro).每条 promising stack 跑 wasm 时,我们需要知道"当前在
+ * 哪个 coro 的 user body 内" — 以便 yield 把值送到正确的 mailbox.
+ *
+ * native 用 OS thread-local (tl_current_coro) 存它,但 wasm/JSPI 下多 promising
+ * stack 共享 thread-local,会跨着踩.改用一个普通 thread-local 数组 +
+ * 计数器构成的栈:
+ *   - stackful_resume[_with_value] 调 tina_wasm_resume 之前 push target,
+ *     之后 pop.
+ *   - stackful_yield[_with_value/_with_flag] 读栈顶拿 self,调 tina_wasm_yield.
+ *   - stackful_running 读栈顶 self_id.
+ *
+ * 关键:push/pop 永远成对出现在同一条 promising stack 的 sync 调用链内
+ * (push 在 resume 调用前,pop 在 resume 返回后).嵌套 resume 时 inner stack
+ * 也是同样的 push→tina_wasm_resume→pop 模式,inner pop 完才轮到 outer pop.
+ * V8 在 tina_wasm_resume 内部 await 切栈,但 await 之前的 push 已经完成,
+ * await 醒来时栈顶仍是该 coro 的 wrapper.
+ *
+ * 32 层够用:嵌套 resume 在 jtask 里不会超过 wakeup_session 的 inner loop
+ * 深度 (实际只有 1-2 层).
+ */
+#define STACKFUL_ACTIVE_STACK_MAX 32
+static THREAD_LOCAL tina_wrapper* sf_active_stack[STACKFUL_ACTIVE_STACK_MAX];
+static THREAD_LOCAL int           sf_active_top = 0;  /* 0 = 空; top index = sf_active_top - 1 */
+
+static inline void sf_active_push(tina_wrapper *w) {
+    if (sf_active_top >= STACKFUL_ACTIVE_STACK_MAX) {
+        fprintf(stderr, "[stackful/wasm] ERROR: active stack overflow (>%d)\n",
+                STACKFUL_ACTIVE_STACK_MAX);
+        abort();
+    }
+    sf_active_stack[sf_active_top++] = w;
+}
+static inline void sf_active_pop(void) {
+    if (sf_active_top <= 0) {
+        fprintf(stderr, "[stackful/wasm] ERROR: active stack underflow\n");
+        abort();
+    }
+    sf_active_stack[--sf_active_top] = NULL;
+}
+static inline tina_wrapper* sf_active_top_ptr(void) {
+    return (sf_active_top > 0) ? sf_active_stack[sf_active_top - 1] : NULL;
+}
+#endif
 
 /* ========== Data storage functions ========== */
 
@@ -214,6 +298,9 @@ int stackful_new(stackful_schedule *S, stackful_func func, void *ud) {
     wrapper->status = STACKFUL_STATUS_SUSPENDED;
     wrapper->yield_count = 0;
     wrapper->self_id = id;  /* Store self ID for asymmetric yield */
+#ifdef __EMSCRIPTEN__
+    wrapper->launched = 0;  /* wasm/JSPI: 推迟到首次 stackful_resume */
+#endif
 
     /* Create Tina coroutine */
     wrapper->coro = tina_init(NULL, TINA_DEFAULT_STACK_SIZE, tina_entry_wrapper, wrapper);
@@ -246,6 +333,68 @@ int stackful_resume(stackful_schedule *S, int id) {
         return -1;
     }
 
+#ifdef __EMSCRIPTEN__
+    /* 🔍 wasm/JSPI 调查诊断 trace(2026-04-30 封存).native 路径无影响. */
+    fprintf(stderr, "[stackful_resume CALLER id=%d] caller_ra=%p\n",
+        id, __builtin_return_address(0)); fflush(stderr);
+    /* ✅ fail-fast: 禁止 self-resume (上层逻辑错误,wasm 下会 deadlock 在
+     * mb_await_out 上).保留作为下次重启 wasm 时的立即 backtrace 入口. */
+    if (target == sf_active_top_ptr()) {
+        fprintf(stderr,
+            "[stackful_resume FATAL] self-resume detected: id=%d caller_ra=%p\n"
+            "  active stack (top→bottom):\n",
+            id, __builtin_return_address(0));
+        for (int i = sf_active_top - 1; i >= 0; i--) {
+            tina_wrapper *w = sf_active_stack[i];
+            fprintf(stderr, "    [%d] wrapper=%p coro=%p self_id=%d\n",
+                i, (void*)w, (void*)(w ? w->coro : NULL), w ? w->self_id : -1);
+        }
+        fflush(stderr);
+        abort();
+    }
+#endif
+
+#ifdef __EMSCRIPTEN__
+    /* wasm/JSPI 路径:走 tina_wasm_launch + tina_wasm_resume,推 active stack.
+     * GC 禁用 + JS_UpdateStackTop 与 native 路径同样语义保守做. */
+    if (!target->launched) {
+        tina_wasm_launch(target->coro);
+        target->launched = 1;
+    }
+    size_t old_gc_threshold = JS_GetGCThreshold(S->rt);
+    JS_SetGCThreshold(S->rt, (size_t)-1);
+
+    sf_active_push(target);
+    target->status = STACKFUL_STATUS_RUNNING;
+    CORO_TRACE_RESUME(-1, id, -1, id);
+    fprintf(stderr, "[stackful_resume id=%d] PRE  active_top=%d\n", id, sf_active_top); fflush(stderr);
+
+    (void)tina_wasm_resume(target->coro, NULL);
+
+    fprintf(stderr, "[stackful_resume id=%d] POST active_top=%d completed=%d\n",
+        id, sf_active_top, target->coro->completed); fflush(stderr);
+    sf_active_pop();
+    fprintf(stderr, "[stackful_resume id=%d] AFTER_POP active_top=%d\n",
+        id, sf_active_top); fflush(stderr);
+
+    JS_SetGCThreshold(S->rt, old_gc_threshold);
+    JS_UpdateStackTop(S->rt);
+
+    if (target->coro->completed) {
+        target->status = STACKFUL_STATUS_DEAD;
+        tina_finalize(target->coro);
+        if (target->coro->buffer) free(target->coro->buffer);
+        free(target);
+        S->coroutines[id] = NULL;
+        S->count--;
+    } else {
+        target->status = STACKFUL_STATUS_SUSPENDED;
+        target->yield_count++;
+    }
+    CORO_TRACE_RESUME_RET(-1, id, id, -1, target->status);
+    return 0;
+#else
+    /* native 路径 (原实现保持不变) */
     /* Get caller coroutine ID for nested context tracking */
     int caller_id = -1;
     if (tl_current_coro) {
@@ -277,12 +426,12 @@ int stackful_resume(stackful_schedule *S, int id) {
     /* ========== ASYMMETRIC COROUTINE: Use tina_resume (proper asymmetric API) ========== */
     DEBUG_LOG("[stackful_resume] >>> CALLING tina_resume(coro %d, NULL)\n", id);
 
-    void *result = tina_resume(target->coro, NULL);
+    (void)tina_resume(target->coro, NULL);
 
     DEBUG_LOG("[stackful_resume] <<< RETURNED from tina_resume\n");
     DEBUG_LOG("[stackful_resume] tl_current_coro=%p (should still be target)\n",
               (void*)tl_current_coro);
-    
+
     /* CRITICAL FIX: Update QuickJS stack top after switching to coroutine's C stack
      * QuickJS detects stack overflow by checking C stack pointer against stack_limit,
      * but stackful coroutine uses a different C stack. Must update stack_top/stack_limit
@@ -298,26 +447,15 @@ int stackful_resume(stackful_schedule *S, int id) {
         DEBUG_LOG("[stackful_resume] Coroutine %d completed, cleaning up\n", id);
 
         target->status = STACKFUL_STATUS_DEAD;
-
-        /* Backend-specific cleanup before freeing buffer (e.g. wasm/JSPI
-         * mailbox map drop). No-op on native backends. */
         tina_finalize(target->coro);
-
-        /* Cleanup */
-        if (target->coro->buffer) {
-            free(target->coro->buffer);
-        }
+        if (target->coro->buffer) free(target->coro->buffer);
         free(target);
-
         S->coroutines[id] = NULL;
         S->count--;
 
-        /* Clear thread-local current coroutine */
         tl_current_coro = NULL;
-
         DEBUG_LOG("[stackful_resume] Coroutine %d destroyed (count=%d)\n", id, S->count);
     } else {
-        /* Yielded */
         target->status = STACKFUL_STATUS_SUSPENDED;
         target->yield_count++;
 
@@ -338,6 +476,7 @@ int stackful_resume(stackful_schedule *S, int id) {
     DEBUG_LOG("[stackful_resume] target_id=%d\n", id);
 
     return 0;
+#endif
 }
 
 void* stackful_resume_with_value(stackful_schedule *S, int id, void *value) {
@@ -353,6 +492,63 @@ void* stackful_resume_with_value(stackful_schedule *S, int id, void *value) {
         return NULL;
     }
 
+#ifdef __EMSCRIPTEN__
+    /* 🔍 wasm/JSPI 调查诊断 trace(2026-04-30 封存).native 路径无影响. */
+    fprintf(stderr, "[stackful_resume_with_value CALLER id=%d] caller_ra=%p v=%p\n",
+        id, __builtin_return_address(0), value); fflush(stderr);
+    /* ✅ fail-fast: 禁止 self-resume,见 stackful_resume 同款注释. */
+    if (target == sf_active_top_ptr()) {
+        fprintf(stderr,
+            "[stackful_resume_with_value FATAL] self-resume detected: id=%d caller_ra=%p\n"
+            "  active stack (top→bottom):\n",
+            id, __builtin_return_address(0));
+        for (int i = sf_active_top - 1; i >= 0; i--) {
+            tina_wrapper *w = sf_active_stack[i];
+            fprintf(stderr, "    [%d] wrapper=%p coro=%p self_id=%d\n",
+                i, (void*)w, (void*)(w ? w->coro : NULL), w ? w->self_id : -1);
+        }
+        fflush(stderr);
+        abort();
+    }
+    /* wasm/JSPI 路径 */
+    if (!target->launched) {
+        tina_wasm_launch(target->coro);
+        target->launched = 1;
+    }
+    size_t old_gc_threshold = JS_GetGCThreshold(S->rt);
+    JS_SetGCThreshold(S->rt, (size_t)-1);
+
+    sf_active_push(target);
+    target->status = STACKFUL_STATUS_RUNNING;
+    fprintf(stderr, "[stackful_resume_with_value id=%d] PRE  active_top=%d v=%p\n",
+        id, sf_active_top, value); fflush(stderr);
+
+    void *result = tina_wasm_resume(target->coro, value);
+
+    fprintf(stderr, "[stackful_resume_with_value id=%d] POST active_top=%d completed=%d r=%p\n",
+        id, sf_active_top, target->coro->completed, result); fflush(stderr);
+    sf_active_pop();
+    fprintf(stderr, "[stackful_resume_with_value id=%d] AFTER_POP active_top=%d\n",
+        id, sf_active_top); fflush(stderr);
+
+    JS_SetGCThreshold(S->rt, old_gc_threshold);
+    JS_UpdateStackTop(S->rt);
+
+    if (target->coro->completed) {
+        target->status = STACKFUL_STATUS_DEAD;
+        tina_finalize(target->coro);
+        if (target->coro->buffer) free(target->coro->buffer);
+        free(target);
+        S->coroutines[id] = NULL;
+        S->count--;
+        result = NULL;
+    } else {
+        target->status = STACKFUL_STATUS_SUSPENDED;
+        target->yield_count++;
+    }
+    return result;
+#else
+    /* native 路径 (原实现保持不变) */
     /* Get caller coroutine ID for nested context tracking */
     int caller_id = -1;
     if (tl_current_coro) {
@@ -405,29 +601,16 @@ void* stackful_resume_with_value(stackful_schedule *S, int id, void *value) {
         DEBUG_LOG("[stackful_resume_with_value] Coroutine %d completed, cleaning up\n", id);
 
         target->status = STACKFUL_STATUS_DEAD;
-
-        /* Backend-specific cleanup before freeing buffer (e.g. wasm/JSPI
-         * mailbox map drop). No-op on native backends. */
         tina_finalize(target->coro);
-
-        /* Cleanup */
-        if (target->coro->buffer) {
-            free(target->coro->buffer);
-        }
+        if (target->coro->buffer) free(target->coro->buffer);
         free(target);
-
         S->coroutines[id] = NULL;
         S->count--;
 
-        /* Clear thread-local current coroutine */
         tl_current_coro = NULL;
-
         DEBUG_LOG("[stackful_resume_with_value] Coroutine %d destroyed (count=%d)\n", id, S->count);
-
-        /* Return NULL for completed coroutine */
         result = NULL;
     } else {
-        /* Yielded */
         target->status = STACKFUL_STATUS_SUSPENDED;
         target->yield_count++;
 
@@ -446,6 +629,7 @@ void* stackful_resume_with_value(stackful_schedule *S, int id, void *value) {
     DEBUG_LOG("[stackful_resume_with_value] target_id=%d, result=%p\n", id, result);
 
     return result;
+#endif
 }
 
 void stackful_yield(stackful_schedule *S) {
@@ -453,7 +637,15 @@ void stackful_yield(stackful_schedule *S) {
         DEBUG_LOG("[stackful_yield] ERROR: NULL scheduler\n");
         return;
     }
-
+#ifdef __EMSCRIPTEN__
+    tina_wrapper *self = sf_active_top_ptr();
+    if (!self) {
+        DEBUG_LOG("[stackful_yield] ERROR: active stack empty (yield outside coro)\n");
+        return;
+    }
+    (void)tina_wasm_yield(self->coro, NULL);
+    JS_UpdateStackTop(S->rt);
+#else
     if (!tl_current_coro) {
         DEBUG_LOG("[stackful_yield] ERROR: No current coroutine (yield called outside coroutine)\n");
         return;
@@ -461,10 +653,10 @@ void stackful_yield(stackful_schedule *S) {
 
     DEBUG_LOG("[stackful_yield] Coroutine yielding to dispatcher\n");
 
-    /* ========== ASYMMETRIC COROUTINE: Use tina_yield (proper asymmetric API) ========== */
     tina_yield(tl_current_coro, NULL);
 
     DEBUG_LOG("[stackful_yield] Coroutine resumed after yield\n");
+#endif
 }
 
 void* stackful_yield_with_value(stackful_schedule *S, void *value) {
@@ -472,7 +664,22 @@ void* stackful_yield_with_value(stackful_schedule *S, void *value) {
         DEBUG_LOG("[stackful_yield_with_value] ERROR: NULL scheduler\n");
         return NULL;
     }
-
+#ifdef __EMSCRIPTEN__
+    tina_wrapper *self = sf_active_top_ptr();
+    if (!self) {
+        DEBUG_LOG("[stackful_yield_with_value] ERROR: active stack empty\n");
+        return NULL;
+    }
+    /* 🔍 wasm/JSPI 调查诊断 trace(2026-04-30 封存).Result 3 实验:跨
+     * yield 的 JSStackFrame 字段 + arg_buf 指针 + arg[0] 内容全保留,
+     * 但 JS 层 args[0] 仍变 undefined → 真根因落在 JS_CallInternal C
+     * 局部缓存,本层无法干预.详见 hand-off "2026-04-30 调查总结". */
+    JS_DiagDumpCurrentFrame(S->main_ctx, "PRE");
+    void *r = tina_wasm_yield(self->coro, value);
+    JS_DiagDumpCurrentFrame(S->main_ctx, "POST");
+    JS_UpdateStackTop(S->rt);
+    return r;
+#else
     if (!tl_current_coro) {
         DEBUG_LOG("[stackful_yield_with_value] ERROR: No current coroutine (yield called outside coroutine)\n");
         return NULL;
@@ -486,7 +693,6 @@ void* stackful_yield_with_value(stackful_schedule *S, void *value) {
     DEBUG_LOG("[stackful_yield_with_value] coro_id=%d, tl_current_coro=%p, value=%p\n",
               coro_id, (void*)tl_current_coro, value);
 
-    /* ========== ASYMMETRIC COROUTINE: Use tina_yield (proper asymmetric API) ========== */
     void *result = tina_yield(tl_current_coro, value);
 
     DEBUG_LOG("[stackful_yield_with_value] === YIELD RESUMED ===\n");
@@ -494,6 +700,7 @@ void* stackful_yield_with_value(stackful_schedule *S, void *value) {
               coro_id, (void*)tl_current_coro, result);
 
     return result;
+#endif
 }
 
 void stackful_yield_with_flag(stackful_schedule *S, int flag) {
@@ -502,6 +709,25 @@ void stackful_yield_with_flag(stackful_schedule *S, int flag) {
         return;
     }
 
+#ifdef __EMSCRIPTEN__
+    tina_wrapper *self = sf_active_top_ptr();
+    if (!self) {
+        DEBUG_LOG("[stackful_yield_with_flag] ERROR: active stack empty\n");
+        return;
+    }
+    int coro_id = self->self_id;
+    if (coro_id < 0 || coro_id >= S->cap) {
+        DEBUG_LOG("[stackful_yield_with_flag] ERROR: Invalid coro_id=%d\n", coro_id);
+        return;
+    }
+    tina_storage *storage = &S->storages[coro_id];
+    if (tina_storage_push(storage, &flag, sizeof(int)) < 0) {
+        DEBUG_LOG("[stackful_yield_with_flag] ERROR: Failed to push flag\n");
+        return;
+    }
+    (void)tina_wasm_yield(self->coro, NULL);
+    JS_UpdateStackTop(S->rt);
+#else
     if (!tl_current_coro) {
         DEBUG_LOG("[stackful_yield_with_flag] ERROR: No current coroutine (yield called outside coroutine)\n");
         return;
@@ -513,9 +739,9 @@ void stackful_yield_with_flag(stackful_schedule *S, int flag) {
         DEBUG_LOG("[stackful_yield_with_flag] ERROR: No wrapper found for current coroutine\n");
         return;
     }
-    
+
     int coro_id = wrapper->self_id;
-    
+
     if (coro_id < 0 || coro_id >= S->cap) {
         DEBUG_LOG("[stackful_yield_with_flag] ERROR: Invalid coro_id=%d\n", coro_id);
         return;
@@ -531,10 +757,10 @@ void stackful_yield_with_flag(stackful_schedule *S, int flag) {
         return;
     }
 
-    /* ========== ASYMMETRIC COROUTINE: Use tina_yield (proper asymmetric API) ========== */
     tina_yield(tl_current_coro, NULL);
 
     DEBUG_LOG("[stackful_yield_with_flag] coro_id=%d resumed after yield\n", coro_id);
+#endif
 }
 
 int stackful_pop_continue_flag(stackful_schedule *S, int id) {
@@ -615,6 +841,10 @@ stackful_status_t stackful_status(stackful_schedule *S, int id) {
 int stackful_running(stackful_schedule *S) {
     (void)S;  /* Unused - kept for API compatibility */
 
+#ifdef __EMSCRIPTEN__
+    tina_wrapper *self = sf_active_top_ptr();
+    return self ? self->self_id : -1;
+#else
     DEBUG_LOG("[stackful_running] CALLED: tl_current_coro=%p\n", (void*)tl_current_coro);
 
     /* Not running in a coroutine context (dispatcher/main thread) */
@@ -635,6 +865,7 @@ int stackful_running(stackful_schedule *S) {
     DEBUG_LOG("[stackful_running] ERROR: tl_current_coro=%p set but wrapper not found\n",
               (void*)tl_current_coro);
     return -1;
+#endif
 }
 
 /* ========== QuickJS Integration ========== */

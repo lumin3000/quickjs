@@ -2603,6 +2603,36 @@ void JS_UpdateStackTop(JSRuntime *rt)
     update_stack_limit(rt);
 }
 
+/* Diagnostic: read-only dump of rt->current_stack_frame.
+ *
+ * 🔍 WASM/JSPI 调查遗留(2026-04-30 封存).只读,native 路径无影响.
+ * 调用点目前仅 quickjs_stackful_mini.c 的 stackful_yield_with_value 内
+ * #ifdef __EMSCRIPTEN__ 分支,native 编译时不会被链接调用.
+ * 详见 docs/handoff_jspi_integration_2026_04_30.md "2026-04-30 调查总结". */
+void JS_DiagDumpCurrentFrame(JSContext *ctx, const char *label)
+{
+    JSStackFrame *sf = ctx->rt->current_stack_frame;
+    if (!sf) {
+        fprintf(stderr, "[sf %s] sf=NULL\n", label); fflush(stderr);
+        return;
+    }
+    int argc = (int)sf->arg_count;
+    fprintf(stderr, "[sf %s] sf=%p arg_buf=%p var_buf=%p arg_count=%d "
+                    "prev_frame=%p\n",
+        label, (void*)sf, (void*)sf->arg_buf, (void*)sf->var_buf,
+        argc, (void*)sf->prev_frame); fflush(stderr);
+    if (sf->arg_buf && argc > 0) {
+        for (int i = 0; i < argc && i < 4; i++) {
+            JSValue v = sf->arg_buf[i];
+            fprintf(stderr, "[sf %s]   arg[%d] @ %p tag=%d ptr=%p\n",
+                label, i, (void*)&sf->arg_buf[i],
+                JS_VALUE_GET_TAG(v),
+                (void*)(intptr_t)JS_VALUE_GET_PTR(v));
+            fflush(stderr);
+        }
+    }
+}
+
 static inline bool is_strict_mode(JSContext *ctx)
 {
     JSStackFrame *sf = ctx->rt->current_stack_frame;
