@@ -214,6 +214,10 @@ int stackful_new(stackful_schedule *S, stackful_func func, void *ud) {
     wrapper->status = STACKFUL_STATUS_SUSPENDED;
     wrapper->yield_count = 0;
     wrapper->self_id = id;  /* Store self ID for asymmetric yield */
+    /* 新协程从空帧链起步; stack_top=0 表示由协程入口的 JS_UpdateStackTop
+     * 自行设置 (见 quickjs.h JSExecutionContext 约定) */
+    wrapper->js_exec.current_stack_frame = NULL;
+    wrapper->js_exec.stack_top = 0;
 
     /* Create Tina coroutine */
     wrapper->coro = tina_init(NULL, TINA_DEFAULT_STACK_SIZE, tina_entry_wrapper, wrapper);
@@ -274,6 +278,14 @@ int stackful_resume(stackful_schedule *S, int id) {
     target->status = STACKFUL_STATUS_RUNNING;
     CORO_TRACE_RESUME(-1, id, -1, id);
 
+    /* 帧链/栈顶按执行上下文成对切换 (2026-07-11 悬垂 prev_frame 修复):
+     * 保存调用侧上下文 → 装入协程挂起时的上下文 (首跑=空帧链)。
+     * 否则协程首帧 prev 指向调用侧深处的帧, 调用侧退栈后协程内 throw,
+     * build_backtrace 走已死栈内存 → 偶发挂死/崩溃。 */
+    JSExecutionContext caller_exec;
+    JS_SaveExecutionContext(S->rt, &caller_exec);
+    JS_RestoreExecutionContext(S->rt, &target->js_exec);
+
     /* ========== ASYMMETRIC COROUTINE: Use tina_resume (proper asymmetric API) ========== */
     DEBUG_LOG("[stackful_resume] >>> CALLING tina_resume(coro %d, NULL)\n", id);
 
@@ -282,12 +294,13 @@ int stackful_resume(stackful_schedule *S, int id) {
     DEBUG_LOG("[stackful_resume] <<< RETURNED from tina_resume\n");
     DEBUG_LOG("[stackful_resume] tl_current_coro=%p (should still be target)\n",
               (void*)tl_current_coro);
-    
-    /* CRITICAL FIX: Update QuickJS stack top after switching to coroutine's C stack
-     * QuickJS detects stack overflow by checking C stack pointer against stack_limit,
-     * but stackful coroutine uses a different C stack. Must update stack_top/stack_limit
-     * to match the current stack position to avoid false "Maximum call stack size exceeded" errors */
-    JS_UpdateStackTop(S->rt);
+
+    /* 协程挂起 (或完成): 存走协程侧上下文, 复原调用侧上下文。
+     * (原 JS_UpdateStackTop 调用被 Restore 取代 — 恢复的是精确快照) */
+    if (!target->coro->completed) {
+        JS_SaveExecutionContext(S->rt, &target->js_exec);
+    }
+    JS_RestoreExecutionContext(S->rt, &caller_exec);
 
     /* Restore GC threshold after leaving Tina stack */
     JS_SetGCThreshold(S->rt, old_gc_threshold);
@@ -376,6 +389,11 @@ void* stackful_resume_with_value(stackful_schedule *S, int id, void *value) {
               (void*)tl_current_coro, id);
     target->status = STACKFUL_STATUS_RUNNING;
 
+    /* 帧链/栈顶按执行上下文成对切换 — 同 stackful_resume, 见彼处注释 */
+    JSExecutionContext caller_exec;
+    JS_SaveExecutionContext(S->rt, &caller_exec);
+    JS_RestoreExecutionContext(S->rt, &target->js_exec);
+
     /* ========== ASYMMETRIC COROUTINE: Use tina_resume (proper asymmetric API) ========== */
     DEBUG_LOG("[stackful_resume_with_value] >>> CALLING tina_resume(coro %d, value=%p)\n",
             id, value);
@@ -386,11 +404,10 @@ void* stackful_resume_with_value(stackful_schedule *S, int id, void *value) {
     DEBUG_LOG("[stackful_resume_with_value] tl_current_coro=%p (should still be target)\n",
               (void*)tl_current_coro);
 
-    /* CRITICAL FIX: Update QuickJS stack top after switching to coroutine's C stack
-     * QuickJS detects stack overflow by checking C stack pointer against stack_limit,
-     * but stackful coroutine uses a different C stack. Must update stack_top/stack_limit
-     * to match the current stack position to avoid false "Maximum call stack size exceeded" errors */
-    JS_UpdateStackTop(S->rt);
+    if (!target->coro->completed) {
+        JS_SaveExecutionContext(S->rt, &target->js_exec);
+    }
+    JS_RestoreExecutionContext(S->rt, &caller_exec);
 
     /* Restore GC threshold after leaving Tina stack */
     JS_SetGCThreshold(S->rt, old_gc_threshold);

@@ -52,6 +52,10 @@ typedef struct {
     stackful_func user_func;     /* Original function */
     int yield_count;             /* Number of yields (for status tracking) */
     int self_id;                 /* This coroutine's ID (for asymmetric yield) */
+    /* 本协程挂起期的 QuickJS 执行上下文 (帧链+栈顶), 每次切换成对保存/
+     * 恢复 — 帧链按协程隔离, 协程内 throw 的 backtrace 不再走进别的栈
+     * (2026-07-11 悬垂 prev_frame 偶发挂死修复) */
+    JSExecutionContext js_exec;
 } tina_wrapper;
 
 /* ========== Scheduler structure ========== */

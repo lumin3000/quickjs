@@ -447,6 +447,22 @@ JS_EXTERN void JS_SetMaxStackSize(JSRuntime *rt, size_t stack_size);
 /* should be called when changing thread to update the stack top value
    used to check stack overflow. */
 JS_EXTERN void JS_UpdateStackTop(JSRuntime *rt);
+/* Stackful-coroutine (fiber) support: the runtime keeps a single linked
+   list of JS stack frames (used by Error backtraces) plus the C-stack
+   bounds used for overflow checks. When user code switches between C
+   stacks (e.g. tina/ucontext fibers), that state MUST be saved on the
+   stack being left and restored on the stack being entered — otherwise a
+   frame pushed on fiber A keeps a prev pointer into a stack that has
+   since unwound, and building a backtrace walks dangling memory.
+   Save/restore the pair around every fiber switch; a fresh fiber starts
+   from {frame = NULL, stack_top = 0} (stack_top 0 = caller must call
+   JS_UpdateStackTop right after entering the fiber). */
+typedef struct JSExecutionContext {
+    void *current_stack_frame;
+    uintptr_t stack_top;
+} JSExecutionContext;
+JS_EXTERN void JS_SaveExecutionContext(JSRuntime *rt, JSExecutionContext *out);
+JS_EXTERN void JS_RestoreExecutionContext(JSRuntime *rt, const JSExecutionContext *in);
 JS_EXTERN JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque);
 JS_EXTERN void JS_FreeRuntime(JSRuntime *rt);
 JS_EXTERN void *JS_GetRuntimeOpaque(JSRuntime *rt);

@@ -2603,6 +2603,24 @@ void JS_UpdateStackTop(JSRuntime *rt)
     update_stack_limit(rt);
 }
 
+/* fiber 切换支持: 见 quickjs.h JSExecutionContext 注释。帧链+栈顶按
+   执行上下文成对保存/恢复, 否则跨栈 prev_frame 悬垂 (2026-07-11 事故:
+   协程内 throw → build_backtrace 走已退栈主栈帧 → 偶发挂死/崩溃)。 */
+void JS_SaveExecutionContext(JSRuntime *rt, JSExecutionContext *out)
+{
+    out->current_stack_frame = rt->current_stack_frame;
+    out->stack_top = rt->stack_top;
+}
+
+void JS_RestoreExecutionContext(JSRuntime *rt, const JSExecutionContext *in)
+{
+    rt->current_stack_frame = in->current_stack_frame;
+    if (in->stack_top) {
+        rt->stack_top = in->stack_top;
+        update_stack_limit(rt);
+    }
+}
+
 static inline bool is_strict_mode(JSContext *ctx)
 {
     JSStackFrame *sf = ctx->rt->current_stack_frame;
