@@ -1456,6 +1456,11 @@ JSValue JS_DupValueRT(JSRuntime *rt, JSValueConst v)
     return js_dup(v);
 }
 
+/* arc: 自动 GC 停顿观测 (arc-main plan_parcel_grow790 §4.5) — 分配点触发的
+   stop-the-world GC 次数/累计停顿, 宿主经绑定读取, 帧探针按帧差归因长帧 */
+double arc_auto_gc_total_ms = 0;
+int arc_auto_gc_count = 0;
+
 static void js_trigger_gc(JSRuntime *rt, size_t size)
 {
     bool force_gc;
@@ -1471,7 +1476,12 @@ static void js_trigger_gc(JSRuntime *rt, size_t size)
             printf("GC: size=%zd\n", rt->malloc_state.malloc_size);
         }
 #endif
-        JS_RunGC(rt);
+        {
+            int64_t t0 = js__gettimeofday_us();
+            JS_RunGC(rt);
+            arc_auto_gc_total_ms += (double)(js__gettimeofday_us() - t0) / 1000.0;
+            arc_auto_gc_count++;
+        }
         rt->malloc_gc_threshold = rt->malloc_state.malloc_size +
             (rt->malloc_state.malloc_size >> 1);
     }
